@@ -1,0 +1,57 @@
+each replica keeps track of:
+  - a vector clock with the highest values it's seen
+    - this is the one that will be sent out as causal metadata
+    - when a replica receives a request, it merges its local vector clock with the vector clock in the request's causal metadata
+    - this is cleared on view change
+  - a vector clock with the highest values it's actually committed to its local kvs
+    - this is cleared on view change
+  - an outgoing update queue for each other replica in the view, containing updates (see below) it needs to send out to the corresponding replica
+    - when processing a put/delete, replicas will enqueue an update to all other replicas in the current view
+    - replicas will periodically attempt to send queued updates to the corresponding replicas, and the queue will be cleared only if doing so was successful
+  - a local update queue, containing updates it needs to process
+    - puts/gets from clients to a node will be added to this, as will updates sent by other replicas
+    - any time things are added to the local queue we go through it and commit all the updates we can, which entails:
+      1. find any queued update whose vector clock is exactly one greater than the local 'highest committed' vector clock, at the index associated with the replica
+      2. if any such update found, submit it to the local kvs (to be run through conflict resolution (see below) and then possibly actually stored* if it wins), and merge the vector clock of the update with the local 'highest committed' vector clock at the index associated with the replica
+         * the entire update is stored**, not just the value
+         ** because of this, we need to do some rewriting of the stored updates when doing a view change, otherwise we'd then possibly be comparing against vector clocks from previous views
+      3. repeat that until no more candidate updates found
+
+the updates contain:
+  - the key
+  - the value, which for a put will be the value, and for a delete will be a special value used to represent deletions (we used null/None)
+  - the current local vector clock
+  - the address of the replica where the request originated (i.e. the replica the client talked to)
+  - a timestamp, taken around when the replica where the request originated started processing the request
+  - the client's address
+
+for conflict resolution, given updates a and b, we prefer b if (in order of precedence, only goes onto the next one if neither wins the previous):
+  if a's vector clock < b's vector clock, b wins
+  if a's timestamp < b's timestamp, b wins
+  if a's client address < b's client address, b wins
+  if a's origin address < b's origin address, b wins
+
+
+node to shard allocation:
+ -nodes are assigned to a each shard in round robin order to ensure a balanced allocation.
+
+for hash partitioning, the key recieved in the request is hashed and the hash value is modded by the number of shards to determine which shard the key belongs too
+  -if the key belongs to the shard hosted by the node that recieved the request, the node applies the update(respecting causal order) and broadcasts to nodes in its cluster
+  -otherwise, the node proxies the request to all nodes in the appropriate shard until atleast one node acknowledges the update.
+
+for resharding:
+    - we send a 'reshard' message to every node in the new view (including ourself, though in practice that one we just trigger locally), telling them about the new view
+    - when a node recieves a 'reshard' message:
+      - if they don't already have a view with that number, they create one
+      - now that they know about the new view, they know which nodes might need to be told about their old data, so they send out a 'reshard data' message to each of those, containing the relevant data from the previous view's kvs, along with the info about the new view
+    - when a node recieves a 'reshard data' message:
+      - if they don't already have a view with that number, they create one
+        - (this needs to happen both in here and in 'reshard' since the node recieving the 'reshard data' may not have gotten the 'reshard' that's supposed to get to them yet)
+      - they apply the data they recieved to the new view's kvs
+
+  - if the previous view's number of shards is the same as the new view's number of shards, we try to make the new view be as close as possible to the old one, but if the number of shards has changed everything just needs to move
+
+other changes since asg3:
+  - added number to views that starts at 0 for a new view and is incremented for each subsequent view (so we have view #0, then after a view change go to #1, then to #2, etc.)
+    - that number is included in causal metadata, and is stored along with the values in the kvs so it can be read while resolving conflicts
+    - we also use those numbers to keep track of both a 'current view' and a 'previous view' kvs
